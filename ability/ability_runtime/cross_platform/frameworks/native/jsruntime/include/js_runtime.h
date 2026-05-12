@@ -85,7 +85,7 @@ public:
         const std::map<std::string, std::string> &packageNameList);
 
     void LoadAce();
-    bool IsPreloadedAce() { return isAcePreloaded_; }
+    bool IsPreloadedAce() const { return isAcePreloaded_; }
 protected:
     JsRuntime() = default;
 
