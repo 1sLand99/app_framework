@@ -19,7 +19,8 @@
 
 namespace OHOS {
 namespace Rosen {
-const GpuApiType RSSystemProperties::systemGpuApiType_ = GpuApiType::OPENGL;
+const GpuApiType RSSystemProperties::systemGpuApiType_ =
+    Drawing::SystemProperties::CheckVulkanEnable() ? GpuApiType::VULKAN : GpuApiType::OPENGL;
 
 int RSSystemProperties::GetDumpFrameNum()
 {

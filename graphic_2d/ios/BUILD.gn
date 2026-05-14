@@ -27,6 +27,9 @@ config("composer_public_config") {
     "//foundation/graphic/graphic_2d/rosen/modules/render_service_base/src/platform/darwin",
     "//foundation/graphic/graphic_2d/interfaces/inner_api/composer",
     "//foundation/graphic/graphic_2d/rosen/modules/2d_graphics/src",
+    "//foundation/appframework/graphic_2d/ios",
+    "//foundation/graphic/graphic_surface/interfaces/inner_api/utils",
+    "//foundation/graphic/graphic_surface/interfaces/inner_api/surface",
   ]
 }
 
@@ -61,6 +64,7 @@ ohos_source_set("ios") {
     "$rosen_root/modules/frame_report/include",
     "//foundation/graphic/graphic_surface/interfaces/inner_api",
     "//foundation/graphic/graphic_surface/interfaces/inner_api/surface",
+    "//foundation/graphic/graphic_2d/rosen/modules/render_service_client/core",
   ]
 
   defines += [
@@ -103,5 +107,25 @@ ohos_source_set("ios") {
   if (defined(use_rosen_drawing) && use_rosen_drawing) {
     defines += [ "USE_ROSEN_DRAWING" ]
     public_deps += [ "$rosen_root/modules/2d_graphics:2d_graphics" ]
+  }
+  if (graphic_2d_feature_enable_vulkan) {
+    defines += [ "RS_ENABLE_VK" ]
+    include_dirs += [
+      "//third_party/MoltenVK/MoltenVK/include/MoltenVK",
+      "//foundation/appframework/graphic_2d/ios/vulkan",
+    ]
+    deps += [ "//third_party/MoltenVK:moltenvk_ios_deps" ]
+    sources += [
+      "rs_vulkan_context.cpp",
+      "vulkan/render_context_vk.mm",
+      "vulkan/rs_surface_frame_ios_vulkan.cpp",
+      "vulkan/rs_surface_swap_chain.cpp",
+      "vulkan/rs_surface_ios_vulkan.mm",
+    ]
+    frameworks += [
+      "Metal.framework",
+      "Foundation.framework",
+      "IOSurface.framework",
+    ]
   }
 }

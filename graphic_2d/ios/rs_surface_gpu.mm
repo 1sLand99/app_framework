@@ -16,7 +16,6 @@
 #include "rs_surface_gpu.h"
 
 #include <memory>
-#include <__nullptr>
 #include <QuartzCore/CALayer.h>
 #include <UIKit/UIKit.h>
 
