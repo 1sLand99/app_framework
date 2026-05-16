@@ -170,7 +170,7 @@ bool RSSurfaceSwapChain::RetrieveSwapchainImages(uint32_t& imageCount)
         swapchain_ = VK_NULL_HANDLE;
         return false;
     }
-    ROSEN_LOGE("RSSurfaceSwapChain::RetrieveSwapchainImages imageCount=%{public}u", imageCount);
+    ROSEN_LOGD("RSSurfaceSwapChain::RetrieveSwapchainImages imageCount=%{public}u", imageCount);
     swapchainImages_.resize(imageCount);
     if (vkInterface.vkGetSwapchainImagesKHR(device, swapchain_, &imageCount, swapchainImages_.data()) != VK_SUCCESS) {
         ROSEN_LOGE("RSSurfaceSwapChain::Create Failed to get swap chain images");
