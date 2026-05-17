@@ -35,9 +35,6 @@ class CFRef {
   }
 
   void Reset(T instance) {
-    if (instance_ == instance) {
-      return;
-    }
     if (instance_ != nullptr) {
       CFRelease(instance_);
     }

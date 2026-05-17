@@ -18,6 +18,9 @@
 #include <event_handler.h>
 #include "platform/common/rs_log.h"
 #include "rs_surface_gpu.h"
+#ifdef RS_ENABLE_VK
+#include "vulkan/rs_surface_ios_vulkan.h"
+#endif
 #include "rs_vsync_client_ios.h"
 
 namespace OHOS {

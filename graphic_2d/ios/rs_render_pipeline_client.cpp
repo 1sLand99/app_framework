@@ -16,6 +16,9 @@
 #include "transaction/rs_render_pipeline_client.h"
 #include "platform/common/rs_log.h"
 #include "rs_surface_gpu.h"
+#ifdef RS_ENABLE_VK
+#include "vulkan/rs_surface_ios_vulkan.h"
+#endif
 #include "rs_vsync_client_ios.h"
 namespace OHOS {
 namespace Rosen {
@@ -152,6 +155,11 @@ bool RSRenderPipelineClient::CreateNode(const RSSurfaceRenderNodeConfig& config)
 std::shared_ptr<RSSurface> RSRenderPipelineClient::CreateNodeAndSurface(const RSSurfaceRenderNodeConfig& config,
     bool unobscured)
 {
+#if defined(RS_ENABLE_VK)
+    if (RSSystemProperties::IsUseVulkan()) {
+        return std::make_shared<RSSurfaceIOSVulkan>(static_cast<void*>(config.additionalData));
+    }
+#endif
     return std::make_shared<RSSurfaceGPU>(static_cast<void*>(config.additionalData));
 }
 
