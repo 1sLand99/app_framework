@@ -31,11 +31,13 @@ public:
     ~RSSurfaceSwapChain();
     bool Initialize(void* metalLayer);
     bool Create(int32_t width, int32_t height);
+    bool CreateImpl(int32_t width, int32_t height);
     bool Recreate(int32_t width, int32_t height);
     VkSurfaceKHR GetSurface() const { return surface_; }
     void Cleanup();
     VkResult AcquireNextImage(uint64_t timeout, VkSemaphore semaphore, uint32_t* imageIndex);
     VkResult Present(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore);
+    void SetLayerDrawableSizeOnMain(int32_t width, int32_t height);
     bool NeedRecreate() const { return needRecreateSwapchain_; }
     void SetNeedRecreate(bool need) { needRecreateSwapchain_ = need; }
     bool IsRecreating() const { return isRecreatingSwapchain_; }
@@ -59,8 +61,9 @@ private:
     VkSwapchainCreateInfoKHR BuildSwapchainCreateInfo(int32_t width, int32_t height,
         const SwapChainSupportDetails& swapChainSupport);
     bool RetrieveSwapchainImages(uint32_t& imageCount);
+    void FlushMetalLayerDrawableOnMain();
+    VkResult PresentImpl(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore);
 
-private:
     void* metalLayer_ = nullptr;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;

@@ -1,0 +1,227 @@
+commit 0da107cb0d7a693551e8e34f3e45fcf60b9a6194
+Author: liuwei <liuwei793@h-partners.com>
+Date:   Fri May 22 14:45:18 2026 +0800
+
+    IOS18释放IOSurface
+    
+    Change-Id: I7ba28772adb8d9c3b62e203161738b1fed1c6fc5
+    Signed-off-by: liuwei <liuwei793@h-partners.com>
+
+diff --git a/graphic_2d/ios/BUILD.gn b/graphic_2d/ios/BUILD.gn
+index a69e75c..785e987 100644
+--- a/graphic_2d/ios/BUILD.gn
++++ b/graphic_2d/ios/BUILD.gn
+@@ -119,7 +119,7 @@ ohos_source_set("ios") {
+       "rs_vulkan_context.cpp",
+       "vulkan/render_context_vk.mm",
+       "vulkan/rs_surface_frame_ios_vulkan.cpp",
+-      "vulkan/rs_surface_swap_chain.cpp",
++      "vulkan/rs_surface_swap_chain.mm",
+       "vulkan/rs_surface_ios_vulkan.mm",
+     ]
+     frameworks += [
+diff --git a/graphic_2d/ios/vulkan/rs_surface_ios_vulkan.mm b/graphic_2d/ios/vulkan/rs_surface_ios_vulkan.mm
+index 99bfb57..6db800e 100644
+--- a/graphic_2d/ios/vulkan/rs_surface_ios_vulkan.mm
++++ b/graphic_2d/ios/vulkan/rs_surface_ios_vulkan.mm
+@@ -54,20 +54,6 @@
+ }
+ 
+ RSSurfaceIOSVulkan::~RSSurfaceIOSVulkan()
+-{
+-    auto cleanupTask = [this]() {
+-        DestroyOnRenderThread();
+-    };
+-    const bool shouldRunDirectly =
+-        !RSRenderThread::GetIsRunning() || RSRenderThread::Instance().IsCurrentRenderThread();
+-    if (!shouldRunDirectly) {
+-        RSRenderThread::Instance().PostSyncTask(cleanupTask);
+-        return;
+-    }
+-    cleanupTask();
+-}
+-
+-void RSSurfaceIOSVulkan::DestroyOnRenderThread()
+ {
+     for (size_t i = 0; i < skiaSurfaces_.size(); i++) {
+         if (skiaSurfaces_[i]) {
+@@ -314,12 +300,7 @@ static void DeleteVkImage(void* context)
+         return nullptr;
+     }
+     if (width != currentWidth_ || height != currentHeight_) {
+-        @autoreleasepool {
+-            CAMetalLayer* layer = (__bridge CAMetalLayer*)metalLayer_;
+-            if (layer) {
+-                layer.drawableSize = CGSizeMake(width, height);
+-            }
+-        }
++        swapChain_.SetLayerDrawableSizeOnMain(width, height);
+         if (!swapChain_.NeedRecreate()) {
+             swapChain_.SetNeedRecreate(true);
+             swapChain_.SetPendingSize(width, height);
+diff --git a/graphic_2d/ios/vulkan/rs_surface_swap_chain.h b/graphic_2d/ios/vulkan/rs_surface_swap_chain.h
+index 1e4e0bd..a71bb97 100644
+--- a/graphic_2d/ios/vulkan/rs_surface_swap_chain.h
++++ b/graphic_2d/ios/vulkan/rs_surface_swap_chain.h
+@@ -37,7 +37,7 @@ public:
+     void Cleanup();
+     VkResult AcquireNextImage(uint64_t timeout, VkSemaphore semaphore, uint32_t* imageIndex);
+     VkResult Present(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore);
+-    VkResult PresentImpl(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore);
++    void SetLayerDrawableSizeOnMain(int32_t width, int32_t height);
+     bool NeedRecreate() const { return needRecreateSwapchain_; }
+     void SetNeedRecreate(bool need) { needRecreateSwapchain_ = need; }
+     bool IsRecreating() const { return isRecreatingSwapchain_; }
+@@ -61,8 +61,9 @@ private:
+     VkSwapchainCreateInfoKHR BuildSwapchainCreateInfo(int32_t width, int32_t height,
+         const SwapChainSupportDetails& swapChainSupport);
+     bool RetrieveSwapchainImages(uint32_t& imageCount);
++    void FlushMetalLayerDrawableOnMain();
++    VkResult PresentImpl(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore);
+ 
+-private:
+     void* metalLayer_ = nullptr;
+     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+diff --git a/graphic_2d/ios/vulkan/rs_surface_swap_chain.cpp b/graphic_2d/ios/vulkan/rs_surface_swap_chain.mm
+similarity index 87%
+rename from graphic_2d/ios/vulkan/rs_surface_swap_chain.cpp
+rename to graphic_2d/ios/vulkan/rs_surface_swap_chain.mm
+index 4ed76f0..3759c51 100644
+--- a/graphic_2d/ios/vulkan/rs_surface_swap_chain.cpp
++++ b/graphic_2d/ios/vulkan/rs_surface_swap_chain.mm
+@@ -17,6 +17,8 @@
+ #include "platform/common/rs_log.h"
+ #include "rs_vulkan_context.h"
+ 
++#include <CoreFoundation/CoreFoundation.h>
++#include <QuartzCore/CAMetalLayer.h>
+ #include <dispatch/dispatch.h>
+ #include <functional>
+ #include <pthread.h>
+@@ -24,11 +26,21 @@
+ namespace OHOS {
+ namespace Rosen {
+ namespace {
+-// MoltenVK configures CAMetalLayer during vkCreateSwapchainKHR / surface setup; iOS requires that on the main thread.
++// iOS 18+ requires pumping the main run loop so Core Animation can recycle IOSurface drawables.
++void PumpMainRunLoopForIOS18()
++{
++    if (@available(iOS 18, *)) {
++        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
++    }
++}
++
++// MoltenVK configures CAMetalLayer during vkCreateSwapchainKHR; layer mutations must run on main thread.
+ bool RunMetalLayerMutationOnMain(std::function<bool()> work)
+ {
+     if (pthread_main_np() != 0) {
+-        return work();
++        bool ok = work();
++        PumpMainRunLoopForIOS18();
++        return ok;
+     }
+     struct Payload {
+         std::function<bool()> fn;
+@@ -38,14 +50,25 @@ bool RunMetalLayerMutationOnMain(std::function<bool()> work)
+     dispatch_sync_f(dispatch_get_main_queue(), &payload, [](void* ctx) {
+         auto* p = static_cast<Payload*>(ctx);
+         p->ok = p->fn();
++        PumpMainRunLoopForIOS18();
+     });
+     return payload.ok;
+ }
+ 
++// vkQueuePresentKHR must run on the main thread; pump run loop so CA can recycle IOSurface drawables.
+ VkResult RunPresentOnMain(std::function<VkResult()> work)
+ {
++    auto pumpRunLoop = []() {
++        if (@available(iOS 18, *)) {
++            PumpMainRunLoopForIOS18();
++        } else {
++            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
++        }
++    };
+     if (pthread_main_np() != 0) {
+-        return work();
++        VkResult result = work();
++        pumpRunLoop();
++        return result;
+     }
+     struct Payload {
+         std::function<VkResult()> fn;
+@@ -55,6 +78,11 @@ VkResult RunPresentOnMain(std::function<VkResult()> work)
+     dispatch_sync_f(dispatch_get_main_queue(), &payload, [](void* ctx) {
+         auto* p = static_cast<Payload*>(ctx);
+         p->result = p->fn();
++        if (@available(iOS 18, *)) {
++            PumpMainRunLoopForIOS18();
++        } else {
++            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
++        }
+     });
+     return payload.result;
+ }
+@@ -289,6 +317,7 @@ static VkCompositeAlphaFlagBitsKHR ChooseSwapChainCompositeAlpha(VkCompositeAlph
+     VkDevice device = vkContext.GetDevice();
+     auto& vkInterface = vkContext.GetRsVulkanInterface();
+     vkInterface.vkDeviceWaitIdle(device);
++    FlushMetalLayerDrawableOnMain();
+ 
+     if (metalLayer_ == nullptr) {
+         ROSEN_LOGE("RSSurfaceSwapChain::Recreate: metal layer is null");
+@@ -324,6 +353,46 @@ static VkCompositeAlphaFlagBitsKHR ChooseSwapChainCompositeAlpha(VkCompositeAlph
+     return true;
+ }
+ 
++void RSSurfaceSwapChain::FlushMetalLayerDrawableOnMain()
++{
++    if (metalLayer_ == nullptr) {
++        return;
++    }
++    auto* layer = static_cast<CAMetalLayer*>(metalLayer_);
++    if (@available(iOS 18, *)) {
++        // iOS 18+: layer mutations and run loop pump must happen on the main thread.
++        RunMetalLayerMutationOnMain([layer]() {
++            layer.drawableSize = CGSizeMake(1, 1);
++            for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
++                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
++            }
++            return true;
++        });
++        return;
++    }
++    // iOS 17 and below: avoid dispatch_sync to main during render-thread teardown (deadlock with UI).
++    layer.drawableSize = CGSizeMake(1, 1);
++}
++
++void RSSurfaceSwapChain::SetLayerDrawableSizeOnMain(int32_t width, int32_t height)
++{
++    if (@available(iOS 18, *)) {
++        RunMetalLayerMutationOnMain([this, width, height]() {
++            if (metalLayer_ == nullptr) {
++                return true;
++            }
++            auto* layer = static_cast<CAMetalLayer*>(metalLayer_);
++            layer.drawableSize = CGSizeMake(width, height);
++            return true;
++        });
++        return;
++    }
++    if (metalLayer_ != nullptr) {
++        auto* layer = static_cast<CAMetalLayer*>(metalLayer_);
++        layer.drawableSize = CGSizeMake(width, height);
++    }
++}
++
+ void RSSurfaceSwapChain::Cleanup()
+ {
+     auto& vkContext = RsVulkanContext::GetSingleton();
+@@ -332,6 +401,7 @@ static VkCompositeAlphaFlagBitsKHR ChooseSwapChainCompositeAlpha(VkCompositeAlph
+     if (device != VK_NULL_HANDLE && vkInterface.vkDeviceWaitIdle) {
+         vkInterface.vkDeviceWaitIdle(device);
+     }
++    FlushMetalLayerDrawableOnMain();
+     CleanupSyncObjects();
+ 
+     if (swapchain_ != VK_NULL_HANDLE) {

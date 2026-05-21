@@ -48,26 +48,12 @@ static constexpr uint16_t MAX_FRAMES_IN_FLIGHT = 3;
 
 RSSurfaceIOSVulkan::RSSurfaceIOSVulkan(void* metalLayer)
 {
-    ROSEN_LOGI("RSSurfaceAndroidVulkan entry with %p", metalLayer);
+    ROSEN_LOGI("RSSurfaceIOSVulkan entry with %p", metalLayer);
     metalLayer_ = [static_cast<CAMetalLayer*>(metalLayer) retain];
     swapChain_.Initialize(metalLayer_);
 }
 
 RSSurfaceIOSVulkan::~RSSurfaceIOSVulkan()
-{
-    auto cleanupTask = [this]() {
-        DestroyOnRenderThread();
-    };
-    const bool shouldRunDirectly =
-        !RSRenderThread::GetIsRunning() || RSRenderThread::Instance().IsCurrentRenderThread();
-    if (!shouldRunDirectly) {
-        RSRenderThread::Instance().PostSyncTask(cleanupTask);
-        return;
-    }
-    cleanupTask();
-}
-
-void RSSurfaceIOSVulkan::DestroyOnRenderThread()
 {
     for (size_t i = 0; i < skiaSurfaces_.size(); i++) {
         if (skiaSurfaces_[i]) {
@@ -77,7 +63,18 @@ void RSSurfaceIOSVulkan::DestroyOnRenderThread()
     skiaSurfaces_.clear();
     skiaSurfaces_.shrink_to_fit();
 
+    if (mSkContext_) {
+        mSkContext_->FlushAndSubmit(true);
+        mSkContext_->PurgeUnlockAndSafeCacheGpuResources();
+    }
+
     swapChain_.Cleanup();
+
+    auto renderContextVk = std::static_pointer_cast<RenderContextVK>(renderContext_);
+    if (renderContextVk != nullptr) {
+        renderContextVk->DeleteSurface();
+    }
+
     [static_cast<CAMetalLayer*>(metalLayer_) release];
     metalLayer_ = nullptr;
     ROSEN_LOGI("RSSurfaceIOSVulkan Destructor");
@@ -303,12 +300,7 @@ std::unique_ptr<RSSurfaceFrame> RSSurfaceIOSVulkan::RequestFrame(
         return nullptr;
     }
     if (width != currentWidth_ || height != currentHeight_) {
-        @autoreleasepool {
-            CAMetalLayer* layer = (__bridge CAMetalLayer*)metalLayer_;
-            if (layer) {
-                layer.drawableSize = CGSizeMake(width, height);
-            }
-        }
+        swapChain_.SetLayerDrawableSizeOnMain(width, height);
         if (!swapChain_.NeedRecreate()) {
             swapChain_.SetNeedRecreate(true);
             swapChain_.SetPendingSize(width, height);
@@ -524,7 +516,17 @@ std::shared_ptr<RenderContext> RSSurfaceIOSVulkan::GetRenderContext()
 
 void RSSurfaceIOSVulkan::SetRenderContext(std::shared_ptr<RenderContext> context)
 {
-    renderContext_ = context;
+    auto newContextVk = std::static_pointer_cast<RenderContextVK>(context);
+    auto oldContextVk = std::static_pointer_cast<RenderContextVK>(renderContext_);
+    if (oldContextVk != newContextVk) {
+        if (oldContextVk != nullptr) {
+            oldContextVk->DeleteSurface();
+        }
+        renderContext_ = context;
+        if (newContextVk != nullptr) {
+            newContextVk->AddSurface();
+        }
+    }
 }
 
 RSSurfaceExtPtr RSSurfaceIOSVulkan::CreateSurfaceExt(const RSSurfaceExtConfig& config)

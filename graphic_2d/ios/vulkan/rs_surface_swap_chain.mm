@@ -17,8 +17,76 @@
 #include "platform/common/rs_log.h"
 #include "rs_vulkan_context.h"
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <QuartzCore/CAMetalLayer.h>
+#include <dispatch/dispatch.h>
+#include <functional>
+#include <pthread.h>
+
 namespace OHOS {
 namespace Rosen {
+namespace {
+// iOS 18+ requires pumping the main run loop so Core Animation can recycle IOSurface drawables.
+void PumpMainRunLoopForIOS18()
+{
+    if (@available(iOS 18, *)) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+    }
+}
+
+// MoltenVK configures CAMetalLayer during vkCreateSwapchainKHR; layer mutations must run on main thread.
+bool RunMetalLayerMutationOnMain(std::function<bool()> work)
+{
+    if (pthread_main_np() != 0) {
+        bool ok = work();
+        PumpMainRunLoopForIOS18();
+        return ok;
+    }
+    struct Payload {
+        std::function<bool()> fn;
+        bool ok = false;
+    };
+    Payload payload { std::move(work) };
+    dispatch_sync_f(dispatch_get_main_queue(), &payload, [](void* ctx) {
+        auto* p = static_cast<Payload*>(ctx);
+        p->ok = p->fn();
+        PumpMainRunLoopForIOS18();
+    });
+    return payload.ok;
+}
+
+// vkQueuePresentKHR must run on the main thread; pump run loop so CA can recycle IOSurface drawables.
+VkResult RunPresentOnMain(std::function<VkResult()> work)
+{
+    auto pumpRunLoop = []() {
+        if (@available(iOS 18, *)) {
+            PumpMainRunLoopForIOS18();
+        } else {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+        }
+    };
+    if (pthread_main_np() != 0) {
+        VkResult result = work();
+        pumpRunLoop();
+        return result;
+    }
+    struct Payload {
+        std::function<VkResult()> fn;
+        VkResult result = VK_ERROR_UNKNOWN;
+    };
+    Payload payload { std::move(work) };
+    dispatch_sync_f(dispatch_get_main_queue(), &payload, [](void* ctx) {
+        auto* p = static_cast<Payload*>(ctx);
+        p->result = p->fn();
+        if (@available(iOS 18, *)) {
+            PumpMainRunLoopForIOS18();
+        } else {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+        }
+    });
+    return payload.result;
+}
+} // namespace
 
 static constexpr uint16_t MAX_FRAMES_IN_FLIGHT = 3;
 static constexpr uint32_t CONCURRENT_QUEUE_FAMILY_COUNT = 2;
@@ -183,6 +251,11 @@ bool RSSurfaceSwapChain::RetrieveSwapchainImages(uint32_t& imageCount)
 
 bool RSSurfaceSwapChain::Create(int32_t width, int32_t height)
 {
+    return RunMetalLayerMutationOnMain([this, width, height]() { return CreateImpl(width, height); });
+}
+
+bool RSSurfaceSwapChain::CreateImpl(int32_t width, int32_t height)
+{
     if (width <= 0 || height <= 0) {
         ROSEN_LOGE("RSSurfaceSwapChain::Create Invalid dimensions: %dx%d", width, height);
         return false;
@@ -245,6 +318,7 @@ bool RSSurfaceSwapChain::Recreate(int32_t width, int32_t height)
     VkDevice device = vkContext.GetDevice();
     auto& vkInterface = vkContext.GetRsVulkanInterface();
     vkInterface.vkDeviceWaitIdle(device);
+    FlushMetalLayerDrawableOnMain();
 
     if (metalLayer_ == nullptr) {
         ROSEN_LOGE("RSSurfaceSwapChain::Recreate: metal layer is null");
@@ -280,6 +354,46 @@ bool RSSurfaceSwapChain::Recreate(int32_t width, int32_t height)
     return true;
 }
 
+void RSSurfaceSwapChain::FlushMetalLayerDrawableOnMain()
+{
+    if (metalLayer_ == nullptr) {
+        return;
+    }
+    auto* layer = static_cast<CAMetalLayer*>(metalLayer_);
+    if (@available(iOS 18, *)) {
+        // iOS 18+: layer mutations and run loop pump must happen on the main thread.
+        RunMetalLayerMutationOnMain([layer]() {
+            layer.drawableSize = CGSizeMake(1, 1);
+            for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+            }
+            return true;
+        });
+        return;
+    }
+    // iOS 17 and below: avoid dispatch_sync to main during render-thread teardown (deadlock with UI).
+    layer.drawableSize = CGSizeMake(1, 1);
+}
+
+void RSSurfaceSwapChain::SetLayerDrawableSizeOnMain(int32_t width, int32_t height)
+{
+    if (@available(iOS 18, *)) {
+        RunMetalLayerMutationOnMain([this, width, height]() {
+            if (metalLayer_ == nullptr) {
+                return true;
+            }
+            auto* layer = static_cast<CAMetalLayer*>(metalLayer_);
+            layer.drawableSize = CGSizeMake(width, height);
+            return true;
+        });
+        return;
+    }
+    if (metalLayer_ != nullptr) {
+        auto* layer = static_cast<CAMetalLayer*>(metalLayer_);
+        layer.drawableSize = CGSizeMake(width, height);
+    }
+}
+
 void RSSurfaceSwapChain::Cleanup()
 {
     auto& vkContext = RsVulkanContext::GetSingleton();
@@ -288,6 +402,7 @@ void RSSurfaceSwapChain::Cleanup()
     if (device != VK_NULL_HANDLE && vkInterface.vkDeviceWaitIdle) {
         vkInterface.vkDeviceWaitIdle(device);
     }
+    FlushMetalLayerDrawableOnMain();
     CleanupSyncObjects();
 
     if (swapchain_ != VK_NULL_HANDLE) {
@@ -318,6 +433,13 @@ VkResult RSSurfaceSwapChain::AcquireNextImage(uint64_t timeout, VkSemaphore sema
 }
 
 VkResult RSSurfaceSwapChain::Present(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore)
+{
+    return RunPresentOnMain([this, queue, imageIndex, waitSemaphore]() {
+        return PresentImpl(queue, imageIndex, waitSemaphore);
+    });
+}
+
+VkResult RSSurfaceSwapChain::PresentImpl(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore)
 {
     if (swapchain_ == VK_NULL_HANDLE || queue == VK_NULL_HANDLE) {
         return VK_ERROR_INITIALIZATION_FAILED;
