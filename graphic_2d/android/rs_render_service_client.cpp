@@ -145,7 +145,7 @@ int32_t RSRenderServiceClient::GetScreenBacklight(ScreenId id)
     return {};
 }
 
-void RSRenderServiceClient::SetScreenBacklight(ScreenId id, uint32_t level)
+void RSRenderServiceClient::SetScreenBacklight(const RsScreenBrightnessData& brightnessData)
 {
 }
 
