@@ -63,6 +63,7 @@ private:
     bool FlushSkiaSurface(std::shared_ptr<Drawing::Surface> surface, VkSemaphore renderFinishedSemaphore);
     void WaitAndSubmitSkiaContext(VkSemaphore waitSemaphore);
     bool PresentSwapchainImage(VkQueue queue, uint32_t imageIndex, VkSemaphore renderFinishedSemaphore);
+    void ReleaseAcquiredSwapchainImage(uint32_t imageIndex);
     Drawing::ColorType ConvertVkFormatToSkiaColorType(VkFormat imageFormat);
 
     void* metalLayer_ = nullptr;

@@ -21,11 +21,15 @@
 #include <QuartzCore/CAMetalLayer.h>
 #include <dispatch/dispatch.h>
 #include <functional>
+#include <memory>
 #include <pthread.h>
 
 namespace OHOS {
 namespace Rosen {
 namespace {
+// Avoid indefinite dispatch_sync(main) deadlocks when the UI thread is waiting on the render thread.
+constexpr int64_t MAIN_DISPATCH_TIMEOUT_NS = 50 * 1000000LL;
+
 // iOS 18+ requires pumping the main run loop so Core Animation can recycle IOSurface drawables.
 void PumpMainRunLoopForIOS18()
 {
@@ -34,60 +38,69 @@ void PumpMainRunLoopForIOS18()
     }
 }
 
+void PumpMainRunLoopOnce()
+{
+    if (@available(iOS 18, *)) {
+        PumpMainRunLoopForIOS18();
+    } else {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+    }
+}
+
+template<typename T>
+bool DispatchOnMainWithTimeout(std::function<T()> work, T& outResult, const char* label)
+{
+    if (pthread_main_np() != 0) {
+        outResult = work();
+        PumpMainRunLoopOnce();
+        return true;
+    }
+
+    struct Payload {
+        std::function<T()> fn;
+        T result {};
+    };
+    auto payload = std::make_shared<Payload>();
+    payload->fn = std::move(work);
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        payload->result = payload->fn();
+        PumpMainRunLoopOnce();
+        dispatch_semaphore_signal(sem);
+    });
+
+    const bool completed = dispatch_semaphore_wait(
+        sem, dispatch_time(DISPATCH_TIME_NOW, MAIN_DISPATCH_TIMEOUT_NS)) == 0;
+    dispatch_release(sem);
+    if (!completed) {
+        ROSEN_LOGE("%{public}s: timed out waiting for main queue (avoid deadlock)", label);
+        return false;
+    }
+    outResult = payload->result;
+    return true;
+}
+
 // MoltenVK configures CAMetalLayer during vkCreateSwapchainKHR; layer mutations must run on main thread.
 bool RunMetalLayerMutationOnMain(std::function<bool()> work)
 {
-    if (pthread_main_np() != 0) {
-        bool ok = work();
-        PumpMainRunLoopForIOS18();
-        return ok;
+    bool ok = false;
+    if (!DispatchOnMainWithTimeout(std::move(work), ok, "RunMetalLayerMutationOnMain")) {
+        return false;
     }
-    struct Payload {
-        std::function<bool()> fn;
-        bool ok = false;
-    };
-    Payload payload { std::move(work) };
-    dispatch_sync_f(dispatch_get_main_queue(), &payload, [](void* ctx) {
-        auto* p = static_cast<Payload*>(ctx);
-        p->ok = p->fn();
-        PumpMainRunLoopForIOS18();
-    });
-    return payload.ok;
+    return ok;
 }
 
 // vkQueuePresentKHR must run on the main thread; pump run loop so CA can recycle IOSurface drawables.
 VkResult RunPresentOnMain(std::function<VkResult()> work)
 {
-    auto pumpRunLoop = []() {
-        if (@available(iOS 18, *)) {
-            PumpMainRunLoopForIOS18();
-        } else {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
-        }
-    };
-    if (pthread_main_np() != 0) {
-        VkResult result = work();
-        pumpRunLoop();
-        return result;
+    VkResult result = VK_ERROR_UNKNOWN;
+    if (!DispatchOnMainWithTimeout(std::move(work), result, "RunPresentOnMain")) {
+        return VK_ERROR_DEVICE_LOST;
     }
-    struct Payload {
-        std::function<VkResult()> fn;
-        VkResult result = VK_ERROR_UNKNOWN;
-    };
-    Payload payload { std::move(work) };
-    dispatch_sync_f(dispatch_get_main_queue(), &payload, [](void* ctx) {
-        auto* p = static_cast<Payload*>(ctx);
-        p->result = p->fn();
-        if (@available(iOS 18, *)) {
-            PumpMainRunLoopForIOS18();
-        } else {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
-        }
-    });
-    return payload.result;
+    return result;
 }
 } // namespace
-
 static constexpr uint16_t MAX_FRAMES_IN_FLIGHT = 3;
 static constexpr uint32_t CONCURRENT_QUEUE_FAMILY_COUNT = 2;
 
@@ -388,10 +401,14 @@ void RSSurfaceSwapChain::SetLayerDrawableSizeOnMain(int32_t width, int32_t heigh
         });
         return;
     }
-    if (metalLayer_ != nullptr) {
-        auto* layer = static_cast<CAMetalLayer*>(metalLayer_);
-        layer.drawableSize = CGSizeMake(width, height);
+    if (metalLayer_ == nullptr) {
+        return;
     }
+    // iOS 17-: post to main without blocking the render thread (sync main can deadlock with UI).
+    void* layer = metalLayer_;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        static_cast<CAMetalLayer*>(layer).drawableSize = CGSizeMake(width, height);
+    });
 }
 
 void RSSurfaceSwapChain::Cleanup()

@@ -45,10 +45,12 @@ namespace OHOS {
 namespace Rosen {
 
 static constexpr uint16_t MAX_FRAMES_IN_FLIGHT = 3;
+// ~3 frames at 60Hz; avoids indefinite block when swapchain images are not returned.
+static constexpr uint64_t ACQUIRE_SWAPCHAIN_IMAGE_TIMEOUT_NS = 50 * 1000000ULL;
 
 RSSurfaceIOSVulkan::RSSurfaceIOSVulkan(void* metalLayer)
 {
-    ROSEN_LOGI("RSSurfaceIOSVulkan entry with %p", metalLayer);
+    ROSEN_LOGI("RSSurfaceAndroidVulkan entry with %p", metalLayer);
     metalLayer_ = [static_cast<CAMetalLayer*>(metalLayer) retain];
     swapChain_.Initialize(metalLayer_);
 }
@@ -245,12 +247,19 @@ uint32_t RSSurfaceIOSVulkan::AcquireSwapchainImage()
 {
     uint32_t imageIndex;
     VkSemaphore imageAvailableSemaphore = swapChain_.GetImageAvailableSemaphore(currentFrame_);
-    VkResult result = swapChain_.AcquireNextImage(UINT64_MAX, imageAvailableSemaphore, &imageIndex);
+    VkResult result = swapChain_.AcquireNextImage(
+        ACQUIRE_SWAPCHAIN_IMAGE_TIMEOUT_NS, imageAvailableSemaphore, &imageIndex);
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
         ROSEN_LOGW("RequestFrame Swapchain out of date or suboptimal, will recreate next frame");
         swapChain_.SetNeedRecreate(true);
         return UINT32_MAX;
-    } else if (result != VK_SUCCESS) {
+    }
+    if (result == VK_TIMEOUT) {
+        ROSEN_LOGW("RequestFrame AcquireNextImage timed out, will recreate next frame");
+        swapChain_.SetNeedRecreate(true);
+        return UINT32_MAX;
+    }
+    if (result != VK_SUCCESS) {
         ROSEN_LOGW("RequestFrame Failed to acquire swapchain image: %d", result);
         return UINT32_MAX;
     }
@@ -301,10 +310,8 @@ std::unique_ptr<RSSurfaceFrame> RSSurfaceIOSVulkan::RequestFrame(
     }
     if (width != currentWidth_ || height != currentHeight_) {
         swapChain_.SetLayerDrawableSizeOnMain(width, height);
-        if (!swapChain_.NeedRecreate()) {
-            swapChain_.SetNeedRecreate(true);
-            swapChain_.SetPendingSize(width, height);
-        }
+        swapChain_.SetNeedRecreate(true);
+        swapChain_.SetPendingSize(width, height);
         currentWidth_ = width;
         currentHeight_ = height;
     }
@@ -324,6 +331,7 @@ std::unique_ptr<RSSurfaceFrame> RSSurfaceIOSVulkan::RequestFrame(
     int32_t swapchainHeight = static_cast<int32_t>(extent.height);
     auto surface = GetOrCreateSkiaSurface(imageIndex, swapchainWidth, swapchainHeight, isProtected);
     if (!surface) {
+        ReleaseAcquiredSwapchainImage(imageIndex);
         return nullptr;
     }
     surface->ClearDrawingArea();
@@ -391,19 +399,47 @@ bool RSSurfaceIOSVulkan::PresentSwapchainImage(
         ROSEN_LOGE("FlushFrame Swapchain out of date, will recreate next frame");
         swapChain_.SetNeedRecreate(true);
         return false;
-    } else if (result == VK_SUBOPTIMAL_KHR) {
+    }
+    if (result == VK_SUBOPTIMAL_KHR) {
         ROSEN_LOGE("FlushFrame Swapchain suboptimal");
-    } else if (result != VK_SUCCESS) {
+    }
+    if (result == VK_ERROR_DEVICE_LOST) {
+        ROSEN_LOGE("FlushFrame Present failed: main dispatch timeout or device lost, will recreate");
+        swapChain_.SetNeedRecreate(true);
+        return false;
+    }
+    if (result != VK_SUCCESS) {
         ROSEN_LOGE("FlushFrame present stage failed: VkResult=%{public}d,imageIndex=%{public}u"
             "currentFrame=%{public}zu",
             static_cast<int32_t>(result), imageIndex, currentFrame_);
+        swapChain_.SetNeedRecreate(true);
         return false;
-    } else {
-        lastPresentedImageIndex_ = imageIndex;
     }
-
+    lastPresentedImageIndex_ = imageIndex;
     currentFrame_ = (currentFrame_ + 1) % MAX_FRAMES_IN_FLIGHT;
     return true;
+}
+
+void RSSurfaceIOSVulkan::ReleaseAcquiredSwapchainImage(uint32_t imageIndex)
+{
+    if (imageIndex == UINT32_MAX || swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
+        return;
+    }
+    if (imageIndex >= swapChain_.GetImageCount()) {
+        return;
+    }
+    auto& vkContext = RsVulkanContext::GetSingleton();
+    VkQueue queue = vkContext.GetPresentQueue();
+    if (queue == VK_NULL_HANDLE) {
+        queue = vkContext.GetGraphicsQueue();
+    }
+    if (queue == VK_NULL_HANDLE) {
+        return;
+    }
+    VkSemaphore waitSemaphore = swapChain_.GetImageAvailableSemaphore(currentFrame_);
+    ROSEN_LOGW("ReleaseAcquiredSwapchainImage: present to return image %{public}u frame %{public}zu",
+        imageIndex, currentFrame_);
+    PresentSwapchainImage(queue, imageIndex, waitSemaphore);
 }
 
 bool RSSurfaceIOSVulkan::FlushFrame(std::unique_ptr<RSSurfaceFrame>& frame, uint64_t uiTimestamp)
@@ -418,12 +454,14 @@ bool RSSurfaceIOSVulkan::FlushFrame(std::unique_ptr<RSSurfaceFrame>& frame, uint
         ROSEN_LOGE("RSSurfaceIOSVulkan::FlushFrame, invalid frame type");
         return false;
     }
+    uint32_t imageIndex = frameVulkan->GetSwapchainImageIndex();
+
     if (swapChain_.IsRecreating() || swapChain_.NeedRecreate()) {
         ROSEN_LOGE("FlushFrame: Swapchain is being recreated, dropping frame");
+        ReleaseAcquiredSwapchainImage(imageIndex);
         return false;
     }
 
-    uint32_t imageIndex = frameVulkan->GetSwapchainImageIndex();
     if (imageIndex >= swapChain_.GetImageCount()) {
         ROSEN_LOGE("FlushFrame: Invalid image index %u (swapchain has %zu images)",
                    imageIndex, swapChain_.GetImageCount());
@@ -432,11 +470,13 @@ bool RSSurfaceIOSVulkan::FlushFrame(std::unique_ptr<RSSurfaceFrame>& frame, uint
 
     if (swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
         ROSEN_LOGE("RSSurfaceIOSVulkan::FlushFrame Swapchain is null");
+        ReleaseAcquiredSwapchainImage(imageIndex);
         return false;
     }
     auto surface = frame->GetSurface();
     if (!surface) {
         ROSEN_LOGE("RSSurfaceIOSVulkan::FlushFrame Invalid surface");
+        ReleaseAcquiredSwapchainImage(imageIndex);
         return false;
     }
 
