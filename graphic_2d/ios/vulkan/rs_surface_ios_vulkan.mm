@@ -442,6 +442,27 @@ void RSSurfaceIOSVulkan::ReleaseAcquiredSwapchainImage(uint32_t imageIndex)
     PresentSwapchainImage(queue, imageIndex, waitSemaphore);
 }
 
+bool RSSurfaceIOSVulkan::CheckSwapchainValidity(uint32_t imageIndex)
+{
+    if (swapChain_.IsRecreating() || swapChain_.NeedRecreate()) {
+        ROSEN_LOGE("CheckSwapchainValidity: Swapchain is being recreated, dropping frame");
+        ReleaseAcquiredSwapchainImage(imageIndex);
+        return false;
+    }
+
+    if (imageIndex >= swapChain_.GetImageCount()) {
+        ROSEN_LOGE("CheckSwapchainValidity: Invalid image index %u (swapchain has %zu images)",
+                   imageIndex, swapChain_.GetImageCount());
+        return false;
+    }
+
+    if (swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
+        ROSEN_LOGE("CheckSwapchainValidity: Swapchain is null");
+        return false;
+    }
+    return true;
+}
+
 bool RSSurfaceIOSVulkan::FlushFrame(std::unique_ptr<RSSurfaceFrame>& frame, uint64_t uiTimestamp)
 {
     if (!frame) {
@@ -455,22 +476,7 @@ bool RSSurfaceIOSVulkan::FlushFrame(std::unique_ptr<RSSurfaceFrame>& frame, uint
         return false;
     }
     uint32_t imageIndex = frameVulkan->GetSwapchainImageIndex();
-
-    if (swapChain_.IsRecreating() || swapChain_.NeedRecreate()) {
-        ROSEN_LOGE("FlushFrame: Swapchain is being recreated, dropping frame");
-        ReleaseAcquiredSwapchainImage(imageIndex);
-        return false;
-    }
-
-    if (imageIndex >= swapChain_.GetImageCount()) {
-        ROSEN_LOGE("FlushFrame: Invalid image index %u (swapchain has %zu images)",
-                   imageIndex, swapChain_.GetImageCount());
-        return false;
-    }
-
-    if (swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
-        ROSEN_LOGE("RSSurfaceIOSVulkan::FlushFrame Swapchain is null");
-        ReleaseAcquiredSwapchainImage(imageIndex);
+    if (!CheckSwapchainValidity(imageIndex)) {
         return false;
     }
     auto surface = frame->GetSurface();
@@ -494,7 +500,19 @@ bool RSSurfaceIOSVulkan::FlushFrame(std::unique_ptr<RSSurfaceFrame>& frame, uint
         return PresentSwapchainImage(queue, imageIndex, waitSemaphore);
     }
 
+    // Check again before submitting - swapchain may have been recreated during FlushSkiaSurface.
+    if (swapChain_.IsRecreating() || swapChain_.NeedRecreate() || swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
+        ROSEN_LOGW("FlushFrame: Swapchain became invalid after flush, dropping frame");
+        return false;
+    }
+
     WaitAndSubmitSkiaContext(waitSemaphore);
+
+    // Final check before present - swapchain may have been recreated during submit.
+    if (swapChain_.IsRecreating() || swapChain_.NeedRecreate() || swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
+        ROSEN_LOGW("FlushFrame: Swapchain became invalid after submit, dropping frame");
+        return false;
+    }
 
     bool result = PresentSwapchainImage(queue, imageIndex, renderFinishedSemaphore);
     if (mSkContext_) {

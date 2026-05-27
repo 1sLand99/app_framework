@@ -50,7 +50,7 @@ public:
     void SetRenderContext(std::shared_ptr<RenderContext> context) override;
     RSSurfaceExtPtr CreateSurfaceExt(const RSSurfaceExtConfig& config) override;
     RSSurfaceExtPtr GetSurfaceExt(const RSSurfaceExtConfig& config) override;
-    void DestroyOnRenderThread();
+    bool CheckSwapchainValidity(uint32_t imageIndex);
     std::shared_ptr<Drawing::Surface> CreateSkiaSurfaceFromSwapchainImage(
         uint32_t imageIndex, int32_t width, int32_t height, bool isProtected);
 
