@@ -38,7 +38,7 @@ constexpr int64_t SWAPCHAIN_CREATE_TIMEOUT_NS = 500 * 1000000LL;
 // When a timeout occurs, we increment this counter so that already-queued but not-yet-executed
 // blocks will skip their work, avoiding races like "render thread gave up, but main thread still
 // creates swapchain".
-static std::atomic<uint64_t> m_mainDispatchGeneration{0};
+static std::atomic<uint64_t> g_mainDispatchGeneration{0};
 
 // iOS 18+ requires pumping the main run loop so Core Animation can recycle IOSurface drawables.
 void PumpMainRunLoopForIOS18()
@@ -66,7 +66,7 @@ bool DispatchOnMainWithTimeout(std::function<T()> work, T& outResult, const char
         return true;
     }
 
-    const uint64_t currentGeneration = m_mainDispatchGeneration.load(std::memory_order_relaxed);
+    const uint64_t currentGeneration = g_mainDispatchGeneration.load(std::memory_order_relaxed);
     struct Payload {
         std::function<T()> fn;
         T result {};
@@ -81,7 +81,7 @@ bool DispatchOnMainWithTimeout(std::function<T()> work, T& outResult, const char
     // Capture the retained semaphore; block will release it when done.
     dispatch_async(dispatch_get_main_queue(), [sem, payload, currentGeneration, label]() {
         // Check generation before execution - skip if stale (timeout already occurred).
-        if (m_mainDispatchGeneration.load(std::memory_order_relaxed) != currentGeneration) {
+        if (g_mainDispatchGeneration.load(std::memory_order_relaxed) != currentGeneration) {
             ROSEN_LOGI("%{public}s: skipping stale task (generation mismatch)", label);
             dispatch_semaphore_signal(sem);
             dispatch_release(sem);  // Release block's reference.
@@ -101,7 +101,7 @@ bool DispatchOnMainWithTimeout(std::function<T()> work, T& outResult, const char
 
     if (!completed) {
         // Timeout: increment generation to discard any pending tasks.
-        m_mainDispatchGeneration.fetch_add(1, std::memory_order_relaxed);
+        g_mainDispatchGeneration.fetch_add(1, std::memory_order_relaxed);
         ROSEN_LOGE("%{public}s: timed out waiting for main queue (avoid deadlock), generation incremented", label);
         return false;
     }
@@ -357,6 +357,12 @@ bool RSSurfaceSwapChain::CreateImpl(int32_t width, int32_t height)
     return true;
 }
 
+void RSSurfaceSwapChain::MarkRecreateFailed()
+{
+    isRecreatingSwapchain_.store(false, std::memory_order_release);
+    needRecreateSwapchain_.store(true, std::memory_order_release);
+}
+
 bool RSSurfaceSwapChain::Recreate(int32_t width, int32_t height)
 {
     std::lock_guard<std::mutex> lock(swapchainRecreateMutex_);
@@ -386,8 +392,7 @@ bool RSSurfaceSwapChain::Recreate(int32_t width, int32_t height)
         ROSEN_LOGE("RSSurfaceSwapChain::Recreate: metal layer is null");
         swapchain_ = oldSwapchain;
         surface_ = oldSurface;
-        isRecreatingSwapchain_.store(false, std::memory_order_release);
-        needRecreateSwapchain_.store(true, std::memory_order_release);
+        MarkRecreateFailed();
         return false;
     }
     if (oldSwapchain != VK_NULL_HANDLE) {
@@ -402,8 +407,7 @@ bool RSSurfaceSwapChain::Recreate(int32_t width, int32_t height)
 
     if (!vkContext.GetRsVulkanInterface().CreateMetalSurface(metalLayer_, surface_)) {
         ROSEN_LOGE("RSSurfaceSwapChain::Recreate: CreateMetalSurface failed");
-        isRecreatingSwapchain_.store(false, std::memory_order_release);
-        needRecreateSwapchain_.store(true, std::memory_order_release);
+        MarkRecreateFailed();
         return false;
     }
     if (!Create(width, height)) {
@@ -412,8 +416,7 @@ bool RSSurfaceSwapChain::Recreate(int32_t width, int32_t height)
             vkContext.DestroySurfaceKHR(surface_);
             surface_ = VK_NULL_HANDLE;
         }
-        isRecreatingSwapchain_.store(false, std::memory_order_release);
-        needRecreateSwapchain_.store(true, std::memory_order_release);
+        MarkRecreateFailed();
         return false;
     }
     swapchainGeneration_.fetch_add(1, std::memory_order_release);

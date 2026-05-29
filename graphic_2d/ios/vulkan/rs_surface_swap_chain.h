@@ -64,6 +64,7 @@ private:
     bool RetrieveSwapchainImages(uint32_t& imageCount);
     void FlushMetalLayerDrawableOnMain();
     VkResult PresentImpl(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore);
+    void MarkRecreateFailed();
 
     void* metalLayer_ = nullptr;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
