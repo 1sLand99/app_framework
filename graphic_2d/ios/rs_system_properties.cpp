@@ -62,6 +62,11 @@ bool RSSystemProperties::GetTestModeEnabled()
     return false;
 }
 
+bool RSSystemProperties::GetAnimationDelayOptimizeEnabled()
+{
+    return false;
+}
+
 bool RSSystemProperties::GetRSClientMultiInstanceEnabled()
 {
     return true;
