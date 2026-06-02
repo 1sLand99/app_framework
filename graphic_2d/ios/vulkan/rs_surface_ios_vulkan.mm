@@ -45,6 +45,8 @@ namespace OHOS {
 namespace Rosen {
 
 static constexpr uint16_t MAX_FRAMES_IN_FLIGHT = 3;
+// ~3 frames at 60Hz; avoids indefinite block when swapchain images are not returned.
+static constexpr uint64_t ACQUIRE_SWAPCHAIN_IMAGE_TIMEOUT_NS = 50 * 1000000ULL;
 
 RSSurfaceIOSVulkan::RSSurfaceIOSVulkan(void* metalLayer)
 {
@@ -55,20 +57,6 @@ RSSurfaceIOSVulkan::RSSurfaceIOSVulkan(void* metalLayer)
 
 RSSurfaceIOSVulkan::~RSSurfaceIOSVulkan()
 {
-    auto cleanupTask = [this]() {
-        DestroyOnRenderThread();
-    };
-    const bool shouldRunDirectly =
-        !RSRenderThread::GetIsRunning() || RSRenderThread::Instance().IsCurrentRenderThread();
-    if (!shouldRunDirectly) {
-        RSRenderThread::Instance().PostSyncTask(cleanupTask);
-        return;
-    }
-    cleanupTask();
-}
-
-void RSSurfaceIOSVulkan::DestroyOnRenderThread()
-{
     for (size_t i = 0; i < skiaSurfaces_.size(); i++) {
         if (skiaSurfaces_[i]) {
             skiaSurfaces_[i].reset();
@@ -77,7 +65,18 @@ void RSSurfaceIOSVulkan::DestroyOnRenderThread()
     skiaSurfaces_.clear();
     skiaSurfaces_.shrink_to_fit();
 
+    if (mSkContext_) {
+        mSkContext_->FlushAndSubmit(true);
+        mSkContext_->PurgeUnlockAndSafeCacheGpuResources();
+    }
+
     swapChain_.Cleanup();
+
+    auto renderContextVk = std::static_pointer_cast<RenderContextVK>(renderContext_);
+    if (renderContextVk != nullptr) {
+        renderContextVk->DeleteSurface();
+    }
+
     [static_cast<CAMetalLayer*>(metalLayer_) release];
     metalLayer_ = nullptr;
     ROSEN_LOGI("RSSurfaceIOSVulkan Destructor");
@@ -248,12 +247,19 @@ uint32_t RSSurfaceIOSVulkan::AcquireSwapchainImage()
 {
     uint32_t imageIndex;
     VkSemaphore imageAvailableSemaphore = swapChain_.GetImageAvailableSemaphore(currentFrame_);
-    VkResult result = swapChain_.AcquireNextImage(UINT64_MAX, imageAvailableSemaphore, &imageIndex);
+    VkResult result = swapChain_.AcquireNextImage(
+        ACQUIRE_SWAPCHAIN_IMAGE_TIMEOUT_NS, imageAvailableSemaphore, &imageIndex);
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
         ROSEN_LOGW("RequestFrame Swapchain out of date or suboptimal, will recreate next frame");
         swapChain_.SetNeedRecreate(true);
         return UINT32_MAX;
-    } else if (result != VK_SUCCESS) {
+    }
+    if (result == VK_TIMEOUT) {
+        ROSEN_LOGW("RequestFrame AcquireNextImage timed out, will recreate next frame");
+        swapChain_.SetNeedRecreate(true);
+        return UINT32_MAX;
+    }
+    if (result != VK_SUCCESS) {
         ROSEN_LOGW("RequestFrame Failed to acquire swapchain image: %d", result);
         return UINT32_MAX;
     }
@@ -303,16 +309,9 @@ std::unique_ptr<RSSurfaceFrame> RSSurfaceIOSVulkan::RequestFrame(
         return nullptr;
     }
     if (width != currentWidth_ || height != currentHeight_) {
-        @autoreleasepool {
-            CAMetalLayer* layer = (__bridge CAMetalLayer*)metalLayer_;
-            if (layer) {
-                layer.drawableSize = CGSizeMake(width, height);
-            }
-        }
-        if (!swapChain_.NeedRecreate()) {
-            swapChain_.SetNeedRecreate(true);
-            swapChain_.SetPendingSize(width, height);
-        }
+        swapChain_.SetLayerDrawableSizeOnMain(width, height);
+        swapChain_.SetNeedRecreate(true);
+        swapChain_.SetPendingSize(width, height);
         currentWidth_ = width;
         currentHeight_ = height;
     }
@@ -332,6 +331,7 @@ std::unique_ptr<RSSurfaceFrame> RSSurfaceIOSVulkan::RequestFrame(
     int32_t swapchainHeight = static_cast<int32_t>(extent.height);
     auto surface = GetOrCreateSkiaSurface(imageIndex, swapchainWidth, swapchainHeight, isProtected);
     if (!surface) {
+        ReleaseAcquiredSwapchainImage(imageIndex);
         return nullptr;
     }
     surface->ClearDrawingArea();
@@ -399,18 +399,67 @@ bool RSSurfaceIOSVulkan::PresentSwapchainImage(
         ROSEN_LOGE("FlushFrame Swapchain out of date, will recreate next frame");
         swapChain_.SetNeedRecreate(true);
         return false;
-    } else if (result == VK_SUBOPTIMAL_KHR) {
+    }
+    if (result == VK_SUBOPTIMAL_KHR) {
         ROSEN_LOGE("FlushFrame Swapchain suboptimal");
-    } else if (result != VK_SUCCESS) {
+    }
+    if (result == VK_ERROR_DEVICE_LOST) {
+        ROSEN_LOGE("FlushFrame Present failed: main dispatch timeout or device lost, will recreate");
+        swapChain_.SetNeedRecreate(true);
+        return false;
+    }
+    if (result != VK_SUCCESS) {
         ROSEN_LOGE("FlushFrame present stage failed: VkResult=%{public}d,imageIndex=%{public}u"
             "currentFrame=%{public}zu",
             static_cast<int32_t>(result), imageIndex, currentFrame_);
+        swapChain_.SetNeedRecreate(true);
         return false;
-    } else {
-        lastPresentedImageIndex_ = imageIndex;
+    }
+    lastPresentedImageIndex_ = imageIndex;
+    currentFrame_ = (currentFrame_ + 1) % MAX_FRAMES_IN_FLIGHT;
+    return true;
+}
+
+void RSSurfaceIOSVulkan::ReleaseAcquiredSwapchainImage(uint32_t imageIndex)
+{
+    if (imageIndex == UINT32_MAX || swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
+        return;
+    }
+    if (imageIndex >= swapChain_.GetImageCount()) {
+        return;
+    }
+    auto& vkContext = RsVulkanContext::GetSingleton();
+    VkQueue queue = vkContext.GetPresentQueue();
+    if (queue == VK_NULL_HANDLE) {
+        queue = vkContext.GetGraphicsQueue();
+    }
+    if (queue == VK_NULL_HANDLE) {
+        return;
+    }
+    VkSemaphore waitSemaphore = swapChain_.GetImageAvailableSemaphore(currentFrame_);
+    ROSEN_LOGW("ReleaseAcquiredSwapchainImage: present to return image %{public}u frame %{public}zu",
+        imageIndex, currentFrame_);
+    PresentSwapchainImage(queue, imageIndex, waitSemaphore);
+}
+
+bool RSSurfaceIOSVulkan::CheckSwapchainValidity(uint32_t imageIndex)
+{
+    if (swapChain_.IsRecreating() || swapChain_.NeedRecreate()) {
+        ROSEN_LOGE("CheckSwapchainValidity: Swapchain is being recreated, dropping frame");
+        ReleaseAcquiredSwapchainImage(imageIndex);
+        return false;
     }
 
-    currentFrame_ = (currentFrame_ + 1) % MAX_FRAMES_IN_FLIGHT;
+    if (imageIndex >= swapChain_.GetImageCount()) {
+        ROSEN_LOGE("CheckSwapchainValidity: Invalid image index %u (swapchain has %zu images)",
+                   imageIndex, swapChain_.GetImageCount());
+        return false;
+    }
+
+    if (swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
+        ROSEN_LOGE("CheckSwapchainValidity: Swapchain is null");
+        return false;
+    }
     return true;
 }
 
@@ -426,25 +475,14 @@ bool RSSurfaceIOSVulkan::FlushFrame(std::unique_ptr<RSSurfaceFrame>& frame, uint
         ROSEN_LOGE("RSSurfaceIOSVulkan::FlushFrame, invalid frame type");
         return false;
     }
-    if (swapChain_.IsRecreating() || swapChain_.NeedRecreate()) {
-        ROSEN_LOGE("FlushFrame: Swapchain is being recreated, dropping frame");
-        return false;
-    }
-
     uint32_t imageIndex = frameVulkan->GetSwapchainImageIndex();
-    if (imageIndex >= swapChain_.GetImageCount()) {
-        ROSEN_LOGE("FlushFrame: Invalid image index %u (swapchain has %zu images)",
-                   imageIndex, swapChain_.GetImageCount());
-        return false;
-    }
-
-    if (swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
-        ROSEN_LOGE("RSSurfaceIOSVulkan::FlushFrame Swapchain is null");
+    if (!CheckSwapchainValidity(imageIndex)) {
         return false;
     }
     auto surface = frame->GetSurface();
     if (!surface) {
         ROSEN_LOGE("RSSurfaceIOSVulkan::FlushFrame Invalid surface");
+        ReleaseAcquiredSwapchainImage(imageIndex);
         return false;
     }
 
@@ -462,7 +500,19 @@ bool RSSurfaceIOSVulkan::FlushFrame(std::unique_ptr<RSSurfaceFrame>& frame, uint
         return PresentSwapchainImage(queue, imageIndex, waitSemaphore);
     }
 
+    // Check again before submitting - swapchain may have been recreated during FlushSkiaSurface.
+    if (swapChain_.IsRecreating() || swapChain_.NeedRecreate() || swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
+        ROSEN_LOGW("FlushFrame: Swapchain became invalid after flush, dropping frame");
+        return false;
+    }
+
     WaitAndSubmitSkiaContext(waitSemaphore);
+
+    // Final check before present - swapchain may have been recreated during submit.
+    if (swapChain_.IsRecreating() || swapChain_.NeedRecreate() || swapChain_.GetSwapchain() == VK_NULL_HANDLE) {
+        ROSEN_LOGW("FlushFrame: Swapchain became invalid after submit, dropping frame");
+        return false;
+    }
 
     bool result = PresentSwapchainImage(queue, imageIndex, renderFinishedSemaphore);
     if (mSkContext_) {
@@ -524,7 +574,17 @@ std::shared_ptr<RenderContext> RSSurfaceIOSVulkan::GetRenderContext()
 
 void RSSurfaceIOSVulkan::SetRenderContext(std::shared_ptr<RenderContext> context)
 {
-    renderContext_ = context;
+    auto newContextVk = std::static_pointer_cast<RenderContextVK>(context);
+    auto oldContextVk = std::static_pointer_cast<RenderContextVK>(renderContext_);
+    if (oldContextVk != newContextVk) {
+        if (oldContextVk != nullptr) {
+            oldContextVk->DeleteSurface();
+        }
+        renderContext_ = context;
+        if (newContextVk != nullptr) {
+            newContextVk->AddSurface();
+        }
+    }
 }
 
 RSSurfaceExtPtr RSSurfaceIOSVulkan::CreateSurfaceExt(const RSSurfaceExtConfig& config)

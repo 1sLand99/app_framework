@@ -57,21 +57,6 @@ RSSurfaceAndroidVulkan::RSSurfaceAndroidVulkan(ANativeWindow* data) : RSSurfaceA
 
 RSSurfaceAndroidVulkan::~RSSurfaceAndroidVulkan()
 {
-    ROSEN_LOGI("RSSurfaceAndroidVulkan Destructor");
-    auto cleanupTask = [this]() {
-        DestroyOnRenderThread();
-    };
-    const int32_t renderTid = RSRenderThread::Instance().GetTid();
-    const bool shouldRunDirectly = !RSRenderThread::GetIsRunning() || renderTid == gettid();
-    if (!shouldRunDirectly) {
-        RSRenderThread::Instance().PostSyncTask(cleanupTask);
-        return;
-    }
-    cleanupTask();
-}
-
-void RSSurfaceAndroidVulkan::DestroyOnRenderThread()
-{
     for (size_t i = 0; i < skiaSurfaces_.size(); i++) {
         if (skiaSurfaces_[i]) {
             skiaSurfaces_[i].reset();
@@ -79,6 +64,10 @@ void RSSurfaceAndroidVulkan::DestroyOnRenderThread()
     }
     skiaSurfaces_.clear();
     skiaSurfaces_.shrink_to_fit();
+    if (mSkContext) {
+        mSkContext->FlushAndSubmit(true);
+        mSkContext->PurgeUnlockAndSafeCacheGpuResources();
+    }
     swapChain_.Cleanup();
     auto rc = GetRenderContextVulkan();
     if (rc != nullptr) {
@@ -513,7 +502,7 @@ void RSSurfaceAndroidVulkan::SetColorSpace(GraphicColorGamut colorSpace)
         ROSEN_LOGD("RSSurfaceAndroidVulkan::SetColorSpace colorspace unchanged, skip");
         return;
     }
-    colorSpace_ = colorSpace;
+    RSSurfaceAndroid::SetColorSpace(colorSpace);
     for (size_t i = 0; i < skiaSurfaces_.size(); i++) {
         if (skiaSurfaces_[i]) {
             skiaSurfaces_[i].reset();

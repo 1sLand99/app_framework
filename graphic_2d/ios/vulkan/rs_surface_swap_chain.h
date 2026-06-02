@@ -16,6 +16,7 @@
 #ifndef RENDER_SERVICE_BASE_SRC_PLATFORM_IOS_RS_SURFACE_SWAP_CHAIN_H
 #define RENDER_SERVICE_BASE_SRC_PLATFORM_IOS_RS_SURFACE_SWAP_CHAIN_H
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 #include <mutex>
@@ -31,14 +32,16 @@ public:
     ~RSSurfaceSwapChain();
     bool Initialize(void* metalLayer);
     bool Create(int32_t width, int32_t height);
+    bool CreateImpl(int32_t width, int32_t height);
     bool Recreate(int32_t width, int32_t height);
     VkSurfaceKHR GetSurface() const { return surface_; }
     void Cleanup();
     VkResult AcquireNextImage(uint64_t timeout, VkSemaphore semaphore, uint32_t* imageIndex);
     VkResult Present(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore);
-    bool NeedRecreate() const { return needRecreateSwapchain_; }
-    void SetNeedRecreate(bool need) { needRecreateSwapchain_ = need; }
-    bool IsRecreating() const { return isRecreatingSwapchain_; }
+    void SetLayerDrawableSizeOnMain(int32_t width, int32_t height);
+    bool NeedRecreate() const { return needRecreateSwapchain_.load(std::memory_order_acquire); }
+    void SetNeedRecreate(bool need) { needRecreateSwapchain_.store(need, std::memory_order_release); }
+    bool IsRecreating() const { return isRecreatingSwapchain_.load(std::memory_order_acquire); }
     VkSwapchainKHR GetSwapchain() const { return swapchain_; }
     VkFormat GetFormat() const { return swapchainFormat_; }
     VkExtent2D GetExtent() const { return swapChainExtent_; }
@@ -59,8 +62,10 @@ private:
     VkSwapchainCreateInfoKHR BuildSwapchainCreateInfo(int32_t width, int32_t height,
         const SwapChainSupportDetails& swapChainSupport);
     bool RetrieveSwapchainImages(uint32_t& imageCount);
+    void FlushMetalLayerDrawableOnMain();
+    VkResult PresentImpl(VkQueue queue, uint32_t imageIndex, VkSemaphore waitSemaphore);
+    void MarkRecreateFailed();
 
-private:
     void* metalLayer_ = nullptr;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
@@ -70,8 +75,9 @@ private:
     std::vector<VkSemaphore> imageAvailableSemaphores_;
     std::vector<VkSemaphore> renderFinishedSemaphores_;
     bool syncObjectsCreated_ = false;
-    bool needRecreateSwapchain_ = false;
-    bool isRecreatingSwapchain_ = false;
+    std::atomic<bool> needRecreateSwapchain_{false};
+    std::atomic<bool> isRecreatingSwapchain_{false};
+    std::atomic<uint64_t> swapchainGeneration_{0};  // Incremented on each swapchain create/destroy.
     std::mutex swapchainRecreateMutex_;
     int32_t pendingWidth_ = 0;
     int32_t pendingHeight_ = 0;
